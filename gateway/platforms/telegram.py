@@ -914,6 +914,35 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.error("[%s] Failed to connect to Telegram: %s", self.name, e, exc_info=True)
             return False
     
+    def _create_bot_for_send_only(self, token: str):
+        """Create a Bot configured like connect(), without starting polling.
+
+        Used by the polling watcher direct-delivery path so getUpdates remains
+        owned by the watcher while outbound Telegram sends still use the normal
+        adapter send/format/retry logic.
+        """
+        request_kwargs = {
+            "connection_pool_size": int(os.getenv("HERMES_TELEGRAM_HTTP_POOL_SIZE", "512")),
+            "pool_timeout": float(os.getenv("HERMES_TELEGRAM_HTTP_POOL_TIMEOUT", "8.0")),
+            "connect_timeout": float(os.getenv("HERMES_TELEGRAM_HTTP_CONNECT_TIMEOUT", "10.0")),
+            "read_timeout": float(os.getenv("HERMES_TELEGRAM_HTTP_READ_TIMEOUT", "20.0")),
+            "write_timeout": float(os.getenv("HERMES_TELEGRAM_HTTP_WRITE_TIMEOUT", "20.0")),
+        }
+        fallback_ips = self._fallback_ips()
+        disable_fallback = os.getenv("HERMES_TELEGRAM_DISABLE_FALLBACK_IPS", "").strip().lower() in ("1", "true", "yes", "on")
+        proxy_targets = ["api.telegram.org", *fallback_ips]
+        proxy_url = resolve_proxy_url("TELEGRAM_PROXY", target_hosts=proxy_targets)
+        if fallback_ips and not proxy_url and not disable_fallback:
+            request = HTTPXRequest(
+                **request_kwargs,
+                httpx_kwargs={"transport": TelegramFallbackTransport(fallback_ips)},
+            )
+        elif proxy_url:
+            request = HTTPXRequest(**request_kwargs, proxy=proxy_url)
+        else:
+            request = HTTPXRequest(**request_kwargs)
+        return Bot(token=token, request=request)
+
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending album flushes, and disconnect."""
         pending_media_group_tasks = list(self._media_group_tasks.values())
