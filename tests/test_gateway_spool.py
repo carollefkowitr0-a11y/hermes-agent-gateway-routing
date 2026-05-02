@@ -2,6 +2,7 @@ import json
 import os
 import sqlite3
 import stat
+import threading
 from pathlib import Path
 
 import pytest
@@ -107,6 +108,47 @@ def test_get_next_queued_filters_by_target_profile_and_returns_oldest(hermes_hom
     assert row is not None
     assert row["id"] == oldest_naval.id
     assert json.loads(row["payload_json"]) == {"order": "oldest"}
+
+
+def test_claim_next_queued_atomically_marks_one_row_processing(hermes_home):
+    spool = GatewaySpool()
+    spool.initialize()
+    first = spool.enqueue_update("telegram", "naval", "naval", 1, {"order": "first"})
+    second = spool.enqueue_update("telegram", "naval", "naval", 2, {"order": "second"})
+
+    claimed = spool.claim_next_queued(target_profile="naval")
+
+    assert claimed is not None
+    assert claimed["id"] == first.id
+    assert claimed["state"] == "processing"
+    assert claimed["attempts"] == 1
+    assert spool.get_row(first.id)["state"] == "processing"
+    assert spool.get_row(second.id)["state"] == "queued"
+
+
+def test_claim_next_queued_does_not_double_claim_under_concurrency(hermes_home):
+    spool = GatewaySpool()
+    spool.initialize()
+    inserted = spool.enqueue_update("telegram", "naval", "naval", 1, {"order": "only"})
+    barrier = threading.Barrier(2)
+    results = []
+
+    def claim_once():
+        barrier.wait(timeout=5)
+        other = GatewaySpool(spool.db_path)
+        other.initialize()
+        results.append(other.claim_next_queued(target_profile="naval"))
+
+    threads = [threading.Thread(target=claim_once) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    claimed = [row for row in results if row is not None]
+    assert len(claimed) == 1
+    assert claimed[0]["id"] == inserted.id
+    assert spool.get_row(inserted.id)["attempts"] == 1
 
 
 def test_mark_state_transitions_queued_item_to_done_or_failed_and_stores_error(hermes_home):

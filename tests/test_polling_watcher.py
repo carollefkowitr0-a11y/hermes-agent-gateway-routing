@@ -8,11 +8,14 @@ import pytest
 from gateway.polling_watcher import (
     DryRunWakeRecorder,
     ProfileWatchConfig,
+    SubprocessWakeRunner,
     WatcherConfig,
     main,
     poll_once,
     read_offset,
     route_update,
+    _token_for_profile,
+    run_live_loop,
 )
 
 
@@ -337,6 +340,140 @@ def test_telegram_update_to_message_event_converts_private_text_message():
     assert event.source.user_name == "f_user"
 
 
+def test_live_loop_refuses_duplicate_resolved_profile_tokens(monkeypatch, tmp_path, capsys):
+    config = WatcherConfig(
+        profiles=[
+            ProfileWatchConfig("franklin", token_env="FRANKLIN_TELEGRAM_BOT_TOKEN", spool_db=tmp_path / "franklin.db"),
+            ProfileWatchConfig("naval", token_env="TELEGRAM_BOT_TOKEN", spool_db=tmp_path / "naval.db"),
+        ],
+        manager_spool_db=tmp_path / "manager.db",
+        default_timeout=0,
+    )
+
+    class ShouldNotPollClient:
+        def get_updates(self, token, offset, timeout, allowed_updates):  # pragma: no cover - must fail closed before polling
+            raise AssertionError("duplicate tokens should be rejected before polling")
+
+    monkeypatch.setattr("gateway.polling_watcher.load_watcher_config", lambda config_path=None: config)
+    monkeypatch.setattr("gateway.polling_watcher.LiveTelegramPollingClient", ShouldNotPollClient)
+    monkeypatch.setenv("FRANKLIN_TELEGRAM_BOT_TOKEN", "same-token-value")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "same-token-value")
+
+    assert run_live_loop(once=True, dry_run=True) == 2
+    output = json.loads(capsys.readouterr().out)
+    assert output["ok"] is False
+    assert output["error"] == "duplicate_profile_token"
+    assert output["profiles"] == ["franklin", "naval"]
+    rendered = json.dumps(output, sort_keys=True)
+    assert "same-token-value" not in rendered
+    assert "FRANKLIN_TELEGRAM_BOT_TOKEN" not in rendered
+    assert "TELEGRAM_BOT_TOKEN" not in rendered
+
+
+def test_profile_token_resolution_reads_profile_env_without_mutating_global_env(monkeypatch, tmp_path):
+    profile_home = tmp_path / "profiles" / "naval"
+    profile_home.mkdir(parents=True)
+    (profile_home / ".env").write_text("SHARED_TOKEN=profile-specific-token\n", encoding="utf-8")
+    monkeypatch.setenv("SHARED_TOKEN", "global-token")
+
+    profile = ProfileWatchConfig("naval", token_env="SHARED_TOKEN", spool_db=profile_home / "gateway_spool.db")
+
+    assert _token_for_profile(profile) == "profile-specific-token"
+    assert os.environ["SHARED_TOKEN"] == "global-token"
+
+
+def test_live_loop_once_returns_nonzero_after_poll_error(monkeypatch, tmp_path, capsys):
+    config = WatcherConfig(
+        profiles=[ProfileWatchConfig("expert", token_env="EXPERT_TOKEN", spool_db=tmp_path / "expert.db")],
+        manager_spool_db=tmp_path / "manager.db",
+        default_timeout=0,
+    )
+
+    class FailingClient:
+        def get_updates(self, token, offset, timeout, allowed_updates):
+            raise RuntimeError("telegram getUpdates failed: URLError")
+
+    monkeypatch.setattr("gateway.polling_watcher.load_watcher_config", lambda config_path=None: config)
+    monkeypatch.setattr("gateway.polling_watcher.LiveTelegramPollingClient", FailingClient)
+    monkeypatch.setenv("EXPERT_TOKEN", "safe-test-token")
+    monkeypatch.setenv("HERMES_WATCHER_ERROR_BASE_SLEEP", "0")
+
+    assert run_live_loop(once=True, dry_run=True) == 2
+    output = json.loads(capsys.readouterr().out)
+    assert output["ok"] is False
+    assert output["error"] == "telegram_poll_failed"
+    assert output["error_type"] == "RuntimeError"
+    assert "URLError" not in json.dumps(output)
+
+
+def test_live_loop_retries_transient_getupdates_error_without_exiting(monkeypatch, tmp_path, capsys):
+    config = WatcherConfig(
+        profiles=[ProfileWatchConfig("expert", token_env="EXPERT_TOKEN", spool_db=tmp_path / "expert.db")],
+        manager_spool_db=tmp_path / "manager.db",
+        default_timeout=0,
+    )
+
+    class FlakyThenStopClient:
+        def __init__(self):
+            self.calls = 0
+
+        def get_updates(self, token, offset, timeout, allowed_updates):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("telegram getUpdates failed: URLError")
+            raise KeyboardInterrupt()
+
+    sleeps = []
+    monkeypatch.setattr("gateway.polling_watcher.load_watcher_config", lambda config_path=None: config)
+    monkeypatch.setattr("gateway.polling_watcher.LiveTelegramPollingClient", FlakyThenStopClient)
+    monkeypatch.setattr("time.sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setenv("EXPERT_TOKEN", "safe-test-token")
+    monkeypatch.setenv("HERMES_WATCHER_ERROR_BASE_SLEEP", "0")
+
+    try:
+        run_live_loop(once=False, dry_run=True)
+    except KeyboardInterrupt:
+        pass
+    else:  # pragma: no cover - defensive assertion
+        raise AssertionError("loop did not continue to second poll")
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert lines[0]["ok"] is False
+    assert lines[0]["error_type"] == "RuntimeError"
+    assert "URLError" not in json.dumps(lines[0])
+
+
+def test_config_mode_loads_profile_dotenv_for_token_resolution(monkeypatch, tmp_path, capsys):
+    profile_home = tmp_path / "profiles" / "franklin"
+    profile_home.mkdir(parents=True)
+    (profile_home / ".env").write_text("FRANKLIN_TELEGRAM_BOT_TOKEN=token-for-franklin\n")
+    config_path = tmp_path / "watcher.json"
+    config_path.write_text(json.dumps({
+        "profiles": [{
+            "profile": "franklin",
+            "token_env": "FRANKLIN_TELEGRAM_BOT_TOKEN",
+            "spool_db": str(profile_home / "gateway_spool.db"),
+            "offset_path": str(profile_home / "offset.json"),
+            "wake_profile": "franklin",
+            "route": "franklin",
+            "timeout": 0,
+        }]
+    }))
+
+    class EmptyClient:
+        def get_updates(self, token, offset, timeout, allowed_updates):
+            assert token == "token-for-franklin"
+            return []
+
+    monkeypatch.delenv("FRANKLIN_TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.setattr("gateway.polling_watcher.LiveTelegramPollingClient", EmptyClient)
+
+    assert run_live_loop(once=True, dry_run=True, config_path=config_path) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["ok"] is True
+    assert output["counts"]["polled_profiles"] == 1
+
+
+
 def test_subprocess_wake_runner_uses_non_dry_run_worker(monkeypatch, tmp_path):
     from gateway.polling_watcher import SubprocessWakeRunner
 
@@ -358,3 +495,62 @@ def test_subprocess_wake_runner_uses_non_dry_run_worker(monkeypatch, tmp_path):
     cmd = calls[0][0]
     assert "gateway.spool_worker" in cmd
     assert "--no-dry-run" in cmd
+
+
+def test_subprocess_wake_runner_rejects_unsafe_profile_log_name(tmp_path):
+    from gateway.polling_watcher import SubprocessWakeRunner
+
+    runner = SubprocessWakeRunner(dry_run=False)
+
+    try:
+        runner.request_wake("../evil", tmp_path / "spool.db", [1])
+    except ValueError as exc:
+        assert "unsafe profile name" in str(exc)
+    else:  # pragma: no cover - defensive assertion
+        raise AssertionError("unsafe profile name was accepted")
+
+
+def test_subprocess_wake_runner_passes_profile_token_env_to_worker_process(monkeypatch, tmp_path):
+    popen_calls = []
+
+    class FakePopen:
+        def __init__(self, cmd, cwd, stdout, stderr, start_new_session, env):
+            popen_calls.append(
+                {
+                    "cmd": cmd,
+                    "cwd": cwd,
+                    "stderr": stderr,
+                    "start_new_session": start_new_session,
+                    "stdout_name": stdout.name,
+                    "env": env,
+                }
+            )
+            stdout.write(b'{"status":"processed"}\n')
+            stdout.flush()
+
+    import subprocess
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setenv("PYTHON", "/custom/python")
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+
+    runner = SubprocessWakeRunner(dry_run=False)
+    plan = runner.request_wake("franklin", tmp_path / "franklin.db", [7], token_env="FRANKLIN_TELEGRAM_BOT_TOKEN")
+
+    log_path = tmp_path / "hermes" / "logs" / "spool-workers" / "franklin.log"
+    assert plan.profile == "franklin"
+    assert popen_calls[0]["cmd"][:6] == [
+        "/custom/python",
+        "-m",
+        "gateway.spool_worker",
+        "--profile",
+        "franklin",
+        "--spool-db",
+    ]
+    assert popen_calls[0]["cmd"][6] == str(tmp_path / "franklin.db")
+    assert popen_calls[0]["stderr"] is subprocess.STDOUT
+    assert popen_calls[0]["start_new_session"] is True
+    assert popen_calls[0]["stdout_name"] == str(log_path)
+    assert popen_calls[0]["env"]["HERMES_WATCHER_PROFILE_TOKEN_ENV_FRANKLIN"] == "FRANKLIN_TELEGRAM_BOT_TOKEN"
+    assert "FRANKLIN_TELEGRAM_BOT_TOKEN" not in json.dumps(runner.plans[0].to_dict())
+    assert log_path.read_text() == '{"status":"processed"}\n'

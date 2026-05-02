@@ -638,6 +638,37 @@ class TelegramAdapter(BasePlatformAdapter):
                     # Persist thread_id to config so we don't recreate on next restart
                     self._persist_dm_topic_thread_id(int(chat_id), topic_name, thread_id)
 
+    def _build_httpx_request(self):
+        """Build a Telegram HTTPXRequest with the same proxy settings as live polling."""
+        def _env_int(name: str, default: int) -> int:
+            try:
+                return int(os.getenv(name, str(default)))
+            except (TypeError, ValueError):
+                return default
+
+        def _env_float(name: str, default: float) -> float:
+            try:
+                return float(os.getenv(name, str(default)))
+            except (TypeError, ValueError):
+                return default
+
+        request_kwargs = {
+            "connection_pool_size": _env_int("HERMES_TELEGRAM_HTTP_POOL_SIZE", 512),
+            "pool_timeout": _env_float("HERMES_TELEGRAM_HTTP_POOL_TIMEOUT", 8.0),
+            "connect_timeout": _env_float("HERMES_TELEGRAM_HTTP_CONNECT_TIMEOUT", 10.0),
+            "read_timeout": _env_float("HERMES_TELEGRAM_HTTP_READ_TIMEOUT", 20.0),
+            "write_timeout": _env_float("HERMES_TELEGRAM_HTTP_WRITE_TIMEOUT", 20.0),
+        }
+        proxy_url = resolve_proxy_url("TELEGRAM_PROXY", target_hosts=["api.telegram.org"])
+        if proxy_url:
+            logger.info("[%s] Proxy detected for Telegram send-only HTTPXRequest", self.name)
+            return HTTPXRequest(**request_kwargs, proxy=proxy_url)
+        return HTTPXRequest(**request_kwargs)
+
+    def _create_bot_for_send_only(self, token: str):
+        """Create a Bot for outbound-only direct spool workers, honoring proxy env."""
+        return Bot(token=token, request=self._build_httpx_request())
+
     async def connect(self) -> bool:
         """Connect to Telegram via polling or webhook.
 

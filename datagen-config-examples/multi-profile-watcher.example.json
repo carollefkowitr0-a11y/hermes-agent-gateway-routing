@@ -1,0 +1,38 @@
+{
+  "manager_profile": "default",
+  "manager_spool_db": "/home/admin/.hermes/gateway_spool.db",
+  "default_timeout": 25,
+  "allowed_updates": ["message", "edited_message", "callback_query"],
+  "profiles": [
+    {
+      "profile": "naval",
+      "enabled": true,
+      "token_env": "TELEGRAM_BOT_TOKEN",
+      "bot_name": "naval",
+      "owned": true,
+      "ambiguous": false,
+      "spool_db": "/home/admin/.hermes/profiles/naval/gateway_spool.db",
+      "offset_path": "/home/admin/.hermes/profiles/naval/telegram_polling_watcher.offset.json",
+      "route_kind": "profile",
+      "route": "naval",
+      "wake_profile": "naval",
+      "allowed_updates": ["message", "edited_message", "callback_query"],
+      "timeout": 25
+    },
+    {
+      "profile": "future-persona-placeholder",
+      "enabled": false,
+      "token_env": "FUTURE_PERSONA_TELEGRAM_BOT_TOKEN",
+      "bot_name": "future_persona_placeholder",
+      "owned": true,
+      "ambiguous": false,
+      "spool_db": "/home/admin/.hermes/profiles/future-persona-placeholder/gateway_spool.db",
+      "offset_path": "/home/admin/.hermes/profiles/future-persona-placeholder/telegram_polling_watcher.offset.json",
+      "route_kind": "profile",
+      "route": "future-persona-placeholder",
+      "wake_profile": "future-persona-placeholder",
+      "allowed_updates": ["message", "edited_message", "callback_query"],
+      "timeout": 25
+    }
+  ]
+}

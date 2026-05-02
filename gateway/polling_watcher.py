@@ -12,20 +12,30 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import tempfile
+import time
+from contextlib import contextmanager
+from dotenv import dotenv_values
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
-from gateway.spool import GatewaySpool
-from gateway.config import Platform, load_gateway_config
-from gateway.platforms.base import MessageEvent, MessageType
-from gateway.platforms.telegram import TelegramAdapter
-from gateway.run import GatewayRunner
-from gateway.session import SessionSource
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from gateway.platforms.base import MessageEvent
 
 
 TokenProvider = Callable[["ProfileWatchConfig"], str]
+_SAFE_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
+def safe_profile_name(profile: str) -> str:
+    value = (profile or "").strip()
+    if not _SAFE_PROFILE_NAME_RE.fullmatch(value):
+        raise ValueError("unsafe profile name")
+    return value
 
 
 class TelegramPollingClient(Protocol):
@@ -65,7 +75,7 @@ class WakePlan:
 class WakeRunner(Protocol):
     """Injected dry-run wake boundary."""
 
-    def request_wake(self, profile: str, spool_db: Path, row_ids: Sequence[int]) -> WakePlan:
+    def request_wake(self, profile: str, spool_db: Path, row_ids: Sequence[int], token_env: str | None = None) -> WakePlan:
         """Record a local wake request and return a privacy-safe plan."""
 
 
@@ -75,7 +85,7 @@ class DryRunWakeRecorder:
     def __init__(self) -> None:
         self.plans: list[WakePlan] = []
 
-    def request_wake(self, profile: str, spool_db: Path, row_ids: Sequence[int]) -> WakePlan:
+    def request_wake(self, profile: str, spool_db: Path, row_ids: Sequence[int], token_env: str | None = None) -> WakePlan:
         plan = WakePlan(profile=profile, spool_db=Path(spool_db), row_ids=tuple(int(row_id) for row_id in row_ids))
         self.plans.append(plan)
         return plan
@@ -113,7 +123,7 @@ class ProfileWatchConfig:
             raise ValueError("route_kind must be 'profile' or 'manager_fallback'")
         if self.timeout is not None and self.timeout < 0:
             raise ValueError("timeout must be non-negative")
-        object.__setattr__(self, "profile", self.profile.strip())
+        object.__setattr__(self, "profile", safe_profile_name(self.profile))
         if self.bot_name is not None:
             if not isinstance(self.bot_name, str) or not self.bot_name.strip():
                 raise ValueError("bot_name must be a non-empty string when provided")
@@ -272,6 +282,8 @@ def poll_once(
 
         next_offset = current_offset
         for update in updates:
+            from gateway.spool import GatewaySpool
+
             update_id = _update_id(update)
             route_target = route_update(update, profile, config)
             spool = GatewaySpool(route_target.spool_db)
@@ -306,7 +318,10 @@ def poll_once(
             summary["counts"]["updates_accepted"] += 1
             wake_profile = route_target.target_profile
             planned_profiles.add(wake_profile)
-            plan = runner.request_wake(wake_profile, route_target.spool_db, (enqueue.id,))
+            plan = _with_profile_token_env(
+                profile,
+                lambda: runner.request_wake(wake_profile, route_target.spool_db, (enqueue.id,), token_env=profile.token_env),
+            )
             summary["wake_plans"].append(plan.to_dict())
 
         profile_summary["next_offset"] = next_offset
@@ -458,20 +473,25 @@ def _message_payload(update: Mapping[str, Any]) -> Mapping[str, Any] | None:
     return event
 
 
-def _message_text(message: Mapping[str, Any]) -> tuple[str, MessageType]:
+def _message_text(message: Mapping[str, Any], message_type_text: Any) -> tuple[str, Any]:
     if isinstance(message.get("text"), str):
-        return message["text"], MessageType.TEXT
+        return message["text"], message_type_text
     if isinstance(message.get("caption"), str):
-        return message["caption"], MessageType.TEXT
-    return "", MessageType.TEXT
+        return message["caption"], message_type_text
+    return "", message_type_text
 
 
-def telegram_update_to_message_event(update: Mapping[str, Any]) -> MessageEvent | None:
+def telegram_update_to_message_event(update: Mapping[str, Any]) -> "MessageEvent | None":
     """Convert a raw Telegram update dict into the gateway MessageEvent seam.
 
     This supports text/caption messages for the polling watcher live path. Other
     update shapes remain queued/failed instead of being silently treated as text.
     """
+
+    from gateway.config import Platform
+    from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.session import SessionSource
+
 
     message = _message_payload(update)
     if message is None:
@@ -480,7 +500,7 @@ def telegram_update_to_message_event(update: Mapping[str, Any]) -> MessageEvent 
     if not isinstance(chat, Mapping) or chat.get("id") is None:
         return None
     user = message.get("from") if isinstance(message.get("from"), Mapping) else {}
-    text, message_type = _message_text(message)
+    text, message_type = _message_text(message, MessageType.TEXT)
     message_id = message.get("message_id")
     thread_id = message.get("message_thread_id")
     chat_type = str(chat.get("type") or "dm")
@@ -525,6 +545,10 @@ class DirectGatewayConsumer:
     """
 
     def __init__(self) -> None:
+        from gateway.config import Platform, load_gateway_config
+        from gateway.platforms.telegram import TelegramAdapter
+        from gateway.run import GatewayRunner
+
         config = load_gateway_config()
         telegram_config = config.platforms.get(Platform.TELEGRAM)
         if telegram_config is None or not telegram_config.enabled or not telegram_config.token:
@@ -548,9 +572,12 @@ class DirectGatewayConsumer:
             if remaining <= 0:
                 for task in tasks:
                     task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
                 raise RuntimeError("direct gateway delivery timed out")
             done, _ = await asyncio.wait(tasks, timeout=min(1.0, remaining), return_when=asyncio.FIRST_COMPLETED)
             for task in done:
+                if task.cancelled():
+                    raise asyncio.CancelledError()
                 exc = task.exception()
                 if exc is not None:
                     raise exc
@@ -566,6 +593,44 @@ class DirectGatewayConsumer:
         if event is None:
             raise RuntimeError("spool row payload cannot be converted to MessageEvent")
         asyncio.run(self._handle_and_drain(event))
+
+
+@dataclass
+class AdaptivePollingPolicy:
+    """Choose an idle sleep delay from recent Telegram update activity."""
+
+    min_sleep: float = 5.0
+    base_sleep: float = 25.0
+    max_sleep: float = 120.0
+    active_window: float = 300.0
+    idle_backoff_after: int = 10
+    last_activity_at: float | None = None
+    consecutive_empty_polls: int = 0
+
+    def __post_init__(self) -> None:
+        if self.min_sleep < 0 or self.base_sleep < 0 or self.max_sleep < 0 or self.active_window < 0:
+            raise ValueError("sleep/window values must be non-negative")
+        if self.idle_backoff_after < 1:
+            raise ValueError("idle_backoff_after must be at least 1")
+        if self.max_sleep < self.base_sleep:
+            raise ValueError("max_sleep must be greater than or equal to base_sleep")
+
+    def next_sleep(self, *, updates_seen: int, now: float | None = None) -> float:
+        current = time.monotonic() if now is None else float(now)
+        if updates_seen > 0:
+            self.last_activity_at = current
+            self.consecutive_empty_polls = 0
+            return float(self.min_sleep)
+
+        self.consecutive_empty_polls += 1
+        if self.last_activity_at is not None and current - self.last_activity_at <= self.active_window:
+            return float(self.min_sleep)
+
+        if self.consecutive_empty_polls < self.idle_backoff_after:
+            return float(self.base_sleep)
+
+        exponent = self.consecutive_empty_polls - self.idle_backoff_after + 1
+        return float(min(self.max_sleep, self.base_sleep * (2 ** exponent)))
 
 
 class LiveTelegramPollingClient:
@@ -624,11 +689,12 @@ class SubprocessWakeRunner:
         self.dry_run = dry_run
         self.plans: list[WakePlan] = []
 
-    def request_wake(self, profile: str, spool_db: Path, row_ids: Sequence[int]) -> WakePlan:
+    def request_wake(self, profile: str, spool_db: Path, row_ids: Sequence[int], token_env: str | None = None) -> WakePlan:
         import subprocess
 
+        safe_profile = safe_profile_name(profile)
         plan = WakePlan(
-            profile=profile,
+            profile=safe_profile,
             spool_db=Path(spool_db),
             row_ids=tuple(int(row_id) for row_id in row_ids),
             dry_run=self.dry_run,
@@ -641,20 +707,88 @@ class SubprocessWakeRunner:
                 "-m",
                 "gateway.spool_worker",
                 "--profile",
-                profile,
+                safe_profile,
                 "--spool-db",
                 str(spool_db),
                 "--once",
                 "--no-dry-run",
             ]
-            subprocess.Popen(  # noqa: S603 - fixed argv, no shell.
-                cmd,
-                cwd=str(Path(__file__).resolve().parents[1]),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
+            env_suffix = safe_profile.upper().replace("-", "_")
+            env = os.environ.copy()
+            if token_env:
+                env[f"HERMES_WATCHER_PROFILE_TOKEN_ENV_{env_suffix}"] = token_env
+            log_dir = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser() / "logs" / "spool-workers"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / f"{safe_profile}.log"
+            log_handle = log_path.open("ab")
+            try:
+                subprocess.Popen(  # noqa: S603 - fixed argv, no shell.
+                    cmd,
+                    cwd=str(Path(__file__).resolve().parents[1]),
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    env=env,
+                )
+            finally:
+                log_handle.close()
         return plan
+
+
+def _require_mapping(value: Any, *, label: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be an object")
+    return value
+
+
+def _load_json_config_file(path: Path) -> Mapping[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    return _require_mapping(data, label="watcher config")
+
+
+def _load_yaml_config_file(path: Path) -> Mapping[str, Any]:
+    try:
+        import yaml  # type: ignore[import-untyped]
+    except ImportError as exc:  # pragma: no cover - depends on optional package
+        raise ValueError("YAML watcher configs require PyYAML; use JSON to avoid optional dependencies") from exc
+    with path.open("r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle)
+    return _require_mapping(data, label="watcher config")
+
+
+def load_watcher_config_file(path: Path | str) -> WatcherConfig:
+    """Load a multi-profile watcher config from JSON (or YAML if available).
+
+    The file contains token environment variable names only; token values are
+    resolved later by the live token provider. JSON is the primary supported
+    format to keep the watcher foundation dependency-light.
+    """
+
+    config_path = Path(path).expanduser()
+    if not config_path.exists():
+        raise FileNotFoundError(config_path)
+    suffix = config_path.suffix.lower()
+    if suffix in {".yaml", ".yml"}:
+        raw = _load_yaml_config_file(config_path)
+    else:
+        raw = _load_json_config_file(config_path)
+
+    profiles_raw = raw.get("profiles")
+    if not isinstance(profiles_raw, list) or not profiles_raw:
+        raise ValueError("watcher config profiles must be a non-empty list")
+    profiles: list[ProfileWatchConfig] = []
+    for index, item in enumerate(profiles_raw):
+        profile_data = dict(_require_mapping(item, label=f"profiles[{index}]"))
+        profiles.append(ProfileWatchConfig(**profile_data))
+
+    return WatcherConfig(
+        profiles=profiles,
+        manager_profile=str(raw.get("manager_profile", "default")),
+        manager_spool_db=raw.get("manager_spool_db"),
+        default_timeout=int(raw.get("default_timeout", 30)),
+        allowed_updates=list(raw["allowed_updates"]) if raw.get("allowed_updates") is not None else None,
+    )
 
 
 def _load_live_naval_config() -> WatcherConfig:
@@ -681,6 +815,14 @@ def _load_live_naval_config() -> WatcherConfig:
     )
 
 
+def load_watcher_config(config_path: Path | str | None = None) -> WatcherConfig:
+    """Load watcher configuration, preserving legacy live Naval env fallback."""
+
+    if config_path:
+        return load_watcher_config_file(config_path)
+    return _load_live_naval_config()
+
+
 def _token_from_env(profile: ProfileWatchConfig) -> str:
     if not profile.token_env:
         raise ValueError("live mode requires token_env")
@@ -690,25 +832,138 @@ def _token_from_env(profile: ProfileWatchConfig) -> str:
     return token
 
 
-def run_live_loop(*, once: bool = False, dry_run: bool = False) -> int:
+@contextmanager
+def _scoped_env(updates: Mapping[str, str]) -> Any:
+    previous = {key: os.environ.get(key) for key in updates}
+    try:
+        os.environ.update({key: value for key, value in updates.items()})
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _profile_token_value_from_env_file(profile: ProfileWatchConfig) -> str | None:
+    if not profile.token_env or profile.spool_db is None:
+        return None
+    env_path = Path(profile.spool_db).expanduser().parent / ".env"
+    if not env_path.exists():
+        return None
+    try:
+        raw = dotenv_values(env_path, encoding="utf-8")
+    except UnicodeDecodeError:
+        raw = dotenv_values(env_path, encoding="latin-1")
+    value = raw.get(profile.token_env)
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _token_for_profile(profile: ProfileWatchConfig) -> str:
+    token = _profile_token_value_from_env_file(profile)
+    if token:
+        return token
+    return _token_from_env(profile)
+
+
+def _with_profile_token_env(profile: ProfileWatchConfig, callback: Callable[[], Any]) -> Any:
+    token = _profile_token_value_from_env_file(profile)
+    if not token or not profile.token_env:
+        return callback()
+    with _scoped_env({profile.token_env: token}):
+        return callback()
+
+
+def _duplicate_resolved_token_profiles(config: WatcherConfig, token_provider: TokenProvider) -> list[list[str]]:
+    """Return enabled profile groups that resolve to the same bot token value.
+
+    The returned data is privacy-safe: profile names only, never token values,
+    env names, labels, hashes, or private identifiers.
+    """
+    owners_by_token: dict[str, list[str]] = {}
+    for profile in config.profiles:
+        if not profile.enabled:
+            continue
+        token = token_provider(profile)
+        owners_by_token.setdefault(token, []).append(profile.profile)
+    return [sorted(owners) for owners in owners_by_token.values() if len(owners) > 1]
+
+
+def run_live_loop(*, once: bool = False, dry_run: bool = False, config_path: Path | str | None = None) -> int:
     from hermes_cli.env_loader import load_hermes_dotenv
 
     hermes_home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
     load_hermes_dotenv(hermes_home=hermes_home, project_env=Path(__file__).resolve().parents[1] / ".env")
-    config = _load_live_naval_config()
+    config = load_watcher_config(config_path)
+    duplicate_profiles = _duplicate_resolved_token_profiles(config, _token_for_profile)
+    if duplicate_profiles:
+        safe = {
+            "ok": False,
+            "dry_run": dry_run,
+            "error": "duplicate_profile_token",
+            "profiles": duplicate_profiles[0],
+        }
+        print(json.dumps(safe, ensure_ascii=False, sort_keys=True), flush=True)
+        return 2
     client = LiveTelegramPollingClient()
     runner: WakeRunner = DryRunWakeRecorder() if dry_run else SubprocessWakeRunner(dry_run=False)
+    policy = AdaptivePollingPolicy(
+        min_sleep=float(os.environ.get("HERMES_WATCHER_MIN_SLEEP", "5")),
+        base_sleep=float(os.environ.get("HERMES_WATCHER_BASE_SLEEP", os.environ.get("HERMES_WATCHER_POLL_TIMEOUT", "25"))),
+        max_sleep=float(os.environ.get("HERMES_WATCHER_MAX_SLEEP", "120")),
+        active_window=float(os.environ.get("HERMES_WATCHER_ACTIVE_WINDOW", "300")),
+        idle_backoff_after=int(os.environ.get("HERMES_WATCHER_IDLE_BACKOFF_AFTER", "10")),
+    )
+    error_base_sleep = float(os.environ.get("HERMES_WATCHER_ERROR_BASE_SLEEP", "5"))
+    error_max_sleep = float(os.environ.get("HERMES_WATCHER_ERROR_MAX_SLEEP", str(policy.max_sleep)))
+    if error_max_sleep < 0 or error_base_sleep < 0:
+        raise ValueError("error sleep values must be non-negative")
+    consecutive_errors = 0
+    successful_polls = 0
     while True:
-        summary = poll_once(config, client, _token_from_env, wake_runner=runner)
+        try:
+            summary = poll_once(config, client, _token_for_profile, wake_runner=runner)
+        except Exception as exc:  # noqa: BLE001 - live watcher must survive transient polling failures.
+            consecutive_errors += 1
+            if error_base_sleep == 0 or error_max_sleep == 0:
+                next_sleep = 0.0
+            else:
+                exponent = min(max(consecutive_errors - 1, 0), 30)
+                next_sleep = min(error_max_sleep, error_base_sleep * (2 ** exponent))
+            safe = {
+                "ok": False,
+                "dry_run": dry_run,
+                "error": "telegram_poll_failed",
+                "error_type": exc.__class__.__name__,
+                "consecutive_errors": consecutive_errors,
+                "next_sleep": next_sleep,
+                "adaptive_empty_polls": policy.consecutive_empty_polls,
+            }
+            print(json.dumps(safe, ensure_ascii=False, sort_keys=True), flush=True)
+            if once:
+                return 2
+            if next_sleep > 0:
+                time.sleep(next_sleep)
+            continue
+        consecutive_errors = 0
+        successful_polls += 1
+        counts = summary.get("counts") if isinstance(summary.get("counts"), Mapping) else {}
+        updates_seen = int(counts.get("updates_seen", 0))
+        next_sleep = policy.next_sleep(updates_seen=updates_seen)
         safe = {
             "ok": summary.get("ok"),
             "dry_run": dry_run,
             "counts": summary.get("counts"),
             "wake_planned_profiles": summary.get("wake_planned_profiles"),
+            "next_sleep": next_sleep,
+            "adaptive_empty_polls": policy.consecutive_empty_polls,
         }
         print(json.dumps(safe, ensure_ascii=False, sort_keys=True), flush=True)
-        if once:
+        if once and successful_polls >= 1:
             return 0
+        if next_sleep > 0:
+            time.sleep(next_sleep)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -721,7 +976,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--live", action="store_true", help="explicitly enable live Telegram getUpdates")
     args = parser.parse_args(argv)
     if args.live:
-        return run_live_loop(once=bool(args.once), dry_run=bool(args.dry_run))
+        return run_live_loop(once=bool(args.once), dry_run=bool(args.dry_run), config_path=args.config)
     if not args.dry_run:
         parser.error("live/non-dry-run polling requires --live")
     summary = {
@@ -744,6 +999,9 @@ __all__ = [
     "WakeRunner",
     "WatcherConfig",
     "LiveTelegramPollingClient",
+    "AdaptivePollingPolicy",
+    "load_watcher_config",
+    "load_watcher_config_file",
     "SubprocessWakeRunner",
     "main",
     "poll_once",

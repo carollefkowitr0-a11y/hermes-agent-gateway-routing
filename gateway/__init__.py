@@ -1,27 +1,19 @@
 """
 Hermes Gateway - Multi-platform messaging integration.
 
-This module provides a unified gateway for connecting the Hermes agent
-to various messaging platforms (Telegram, Discord, WhatsApp) with:
-- Session management (persistent conversations with reset policies)
-- Dynamic context injection (agent knows where messages come from)
-- Delivery routing (cron job outputs to appropriate channels)
-- Platform-specific toolsets (different capabilities per platform)
+This package exposes gateway config/session/delivery helpers lazily so importing
+lightweight submodules (for example polling watchers) does not eagerly load the
+full gateway runtime.
 """
 
-from .config import GatewayConfig, PlatformConfig, HomeChannel, load_gateway_config
-from .session import (
-    SessionContext,
-    SessionStore,
-    SessionResetPolicy,
-    build_session_context_prompt,
-)
-from .delivery import DeliveryRouter, DeliveryTarget
+_CONFIG_EXPORTS = {"GatewayConfig", "PlatformConfig", "HomeChannel", "load_gateway_config"}
+_SESSION_EXPORTS = {"SessionContext", "SessionStore", "SessionResetPolicy", "build_session_context_prompt"}
+_DELIVERY_EXPORTS = {"DeliveryRouter", "DeliveryTarget"}
 
 __all__ = [
     # Config
     "GatewayConfig",
-    "PlatformConfig", 
+    "PlatformConfig",
     "HomeChannel",
     "load_gateway_config",
     # Session
@@ -33,3 +25,19 @@ __all__ = [
     "DeliveryRouter",
     "DeliveryTarget",
 ]
+
+
+def __getattr__(name: str):
+    if name in _CONFIG_EXPORTS:
+        from . import config
+
+        return getattr(config, name)
+    if name in _SESSION_EXPORTS:
+        from . import session
+
+        return getattr(session, name)
+    if name in _DELIVERY_EXPORTS:
+        from . import delivery
+
+        return getattr(delivery, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
